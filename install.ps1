@@ -5,7 +5,7 @@
 .DESCRIPTION
     Sets up GRUB bootloader on the EFI partition to boot a Linux ISO
     directly from your hard drive. No USB stick needed. No bloatware.
-    Downloads GRUB binaries from official Ubuntu package archive.
+    Downloads GRUB binaries from GitHub release (GNU GRUB 2.12, GPL v3).
     Works on UEFI systems with GPT partition table.
 .EXAMPLE
     .\install.ps1 -IsoPath "C:\Users\Me\Downloads\ubuntu-24.04-desktop-amd64.iso"
@@ -30,96 +30,41 @@ $ErrorActionPreference = "Stop"
 $EfiDir = "EFI\grub-direct-boot"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StateFile = Join-Path $env:ProgramData "grub-direct-boot-state.txt"
-$GrubPkgUrl = "http://archive.ubuntu.com/ubuntu/pool/main/g/grub2-unsigned/grub-efi-amd64-bin_2.12-1ubuntu7_amd64.deb"
+$GrubZipUrl = "https://github.com/rakovi4/grub-direct-boot/releases/download/v1.0.0/grub-efi-x64.zip"
 
 function Write-Step($msg) { Write-Host "  [*] $msg" -ForegroundColor Cyan }
 function Write-OK($msg)   { Write-Host "  [+] $msg" -ForegroundColor Green }
 function Write-Err($msg)  { Write-Host "  [-] $msg" -ForegroundColor Red }
 
-# --- Download and extract GRUB from Ubuntu package ---
+# --- Download and extract GRUB binaries ---
 function Get-GrubFiles {
     $tempDir = Join-Path $env:TEMP "grub-direct-boot-dl"
-    $debFile = Join-Path $tempDir "grub.deb"
-    $extractDir = Join-Path $tempDir "extract"
+    $zipFile = Join-Path $tempDir "grub-efi-x64.zip"
 
     if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
-    # Download .deb
-    Write-Step "Downloading GRUB from Ubuntu archive (~1.6 MB)..."
+    # Download .zip from GitHub release
+    Write-Step "Downloading GRUB binaries (~4.2 MB)..."
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $GrubPkgUrl -OutFile $debFile -UseBasicParsing
+    Invoke-WebRequest -Uri $GrubZipUrl -OutFile $zipFile -UseBasicParsing
 
-    if (-not (Test-Path $debFile)) { throw "Download failed" }
+    if (-not (Test-Path $zipFile)) { throw "Download failed" }
     Write-OK "Downloaded"
 
-    # Parse .deb (ar archive) to extract data.tar
-    Write-Step "Extracting GRUB modules..."
-    $bytes = [System.IO.File]::ReadAllBytes($debFile)
+    # Extract using built-in PowerShell
+    Write-Step "Extracting GRUB files..."
+    Expand-Archive -Path $zipFile -DestinationPath $tempDir -Force
 
-    # ar format: 8-byte magic "!<arch>\n", then entries with 60-byte headers
-    $pos = 8  # skip ar magic
-    $dataTarFile = $null
+    $grubDir = Join-Path $tempDir "grub"
+    if (-not (Test-Path $grubDir)) { throw "GRUB files not found in archive" }
 
-    while ($pos -lt $bytes.Length) {
-        # Read 60-byte ar header
-        $name = [System.Text.Encoding]::ASCII.GetString($bytes, $pos, 16).Trim()
-        $sizeStr = [System.Text.Encoding]::ASCII.GetString($bytes, $pos + 48, 10).Trim()
-        $size = [int64]$sizeStr
-        $pos += 60  # skip header
-
-        if ($name -like "data.tar*") {
-            $dataFile = Join-Path $tempDir $name
-            $stream = [System.IO.File]::Create($dataFile)
-            $stream.Write($bytes, $pos, $size)
-            $stream.Close()
-            $dataTarFile = $dataFile
-        }
-
-        $pos += $size
-        if ($pos % 2 -ne 0) { $pos++ }  # ar entries are 2-byte aligned
-    }
-
-    if (-not $dataTarFile) { throw "Could not find data.tar in .deb package" }
-
-    # Extract data.tar using Windows built-in tar
-    & tar -xf $dataTarFile -C $extractDir 2>&1 | Out-Null
-
-    # Find extracted GRUB files
-    $modDir = Get-ChildItem -Path $extractDir -Recurse -Directory -Filter "x86_64-efi" | Select-Object -First 1
-    if (-not $modDir) { throw "GRUB modules not found in package" }
-
-    $grubRoot = $modDir.Parent.FullName
-    Write-OK "Extracted GRUB modules"
+    Write-OK "Extracted GRUB files"
 
     return @{
-        ModulesDir = $modDir.FullName
-        GrubDir = $grubRoot
+        GrubDir = $grubDir
         TempDir = $tempDir
     }
-}
-
-# --- Build grubx64.efi from modules ---
-function Build-GrubEfi($modulesDir, $outputPath) {
-    # Instead of building, use the pre-built monolithic image if available,
-    # or copy the modular setup (modules loaded via grub.cfg insmod)
-    # Ubuntu package includes individual .mod files — we use insmod in grub.cfg
-    # We need a minimal grubx64.efi — check if one exists in the package
-    $coreImg = Join-Path (Split-Path $modulesDir) "grubx64.efi"
-    if (Test-Path $coreImg) {
-        Copy-Item $coreImg $outputPath -Force
-        return
-    }
-
-    # Look for any EFI binary in the package
-    $efiFiles = Get-ChildItem -Path (Split-Path $modulesDir) -Filter "*.efi" -Recurse
-    if ($efiFiles) {
-        Copy-Item $efiFiles[0].FullName $outputPath -Force
-        return
-    }
-
-    throw "No GRUB EFI binary found in package. The grub-efi-amd64-bin package may have changed structure."
 }
 
 # --- Find and mount EFI partition ---
@@ -136,10 +81,11 @@ list vol
     $diskpartScript | Out-File -FilePath "$env:TEMP\gdb-listvol.txt" -Encoding ASCII
     $output = & diskpart /s "$env:TEMP\gdb-listvol.txt" 2>&1 | Out-String
 
-    $lines = $output -split "`n" | Where-Object { $_ -match "FAT32" -and $_ -match "System" }
+    # Match FAT32 + ~100 MB EFI partition (locale-independent: just match FAT32 + 100)
+    $lines = @($output -split "`n" | Where-Object { $_ -match "FAT32" -and $_ -match "\b100\b" })
     if (-not $lines) {
-        # Fallback: try matching by size (100 MB typical EFI)
-        $lines = $output -split "`n" | Where-Object { $_ -match "FAT32" -and $_ -match "100 M" }
+        # Broader fallback: any FAT32 volume (EFI is typically the only one)
+        $lines = @($output -split "`n" | Where-Object { $_ -match "FAT32" })
     }
     if (-not $lines) { throw "Could not find EFI System Partition (FAT32)" }
 
@@ -150,7 +96,9 @@ select volume $volNum
 assign letter=$letter
 "@
     $assignScript | Out-File -FilePath "$env:TEMP\gdb-assign.txt" -Encoding ASCII
-    & diskpart /s "$env:TEMP\gdb-assign.txt" | Out-Null
+    & diskpart /s "$env:TEMP\gdb-assign.txt" 2>&1 | Out-Null
+
+    Start-Sleep -Seconds 2
 
     if (-not (Test-Path "${letter}:\")) {
         throw "Failed to mount EFI partition"
@@ -232,20 +180,9 @@ try {
         Write-Step "Copying GRUB files to $target"
 
         New-Item -ItemType Directory -Path $target -Force | Out-Null
-        New-Item -ItemType Directory -Path "$target\x86_64-efi" -Force | Out-Null
 
-        # Copy modules
-        Copy-Item "$($grub.ModulesDir)\*" "$target\x86_64-efi\" -Force
-
-        # Copy or locate EFI binary
-        Build-GrubEfi $grub.ModulesDir "$target\grubx64.efi"
-
-        # Copy fonts if available
-        $fontDir = Join-Path $grub.GrubDir "fonts"
-        if (Test-Path $fontDir) {
-            New-Item -ItemType Directory -Path "$target\fonts" -Force | Out-Null
-            Copy-Item "$fontDir\*" "$target\fonts\" -Force
-        }
+        # Copy entire GRUB directory (grubx64.efi + x86_64-efi/ + fonts/)
+        Copy-Item "$($grub.GrubDir)\*" "$target\" -Recurse -Force
 
         Write-OK "GRUB files copied to EFI partition"
 
